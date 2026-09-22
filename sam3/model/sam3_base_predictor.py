@@ -151,6 +151,25 @@ class Sam3BasePredictor:
             init_kwargs["async_loading_frames"] = self.async_loading_frames
         if hasattr(self, "video_loader_type"):
             init_kwargs["video_loader_type"] = self.video_loader_type
+
+        # SAM3 model variants do not all expose the same init_state keyword
+        # arguments. In particular, the multiplex model does not currently
+        # accept offload_state_to_cpu. Forward only supported arguments while
+        # preserving models that intentionally accept arbitrary **kwargs.
+        import inspect
+
+        init_state_signature = inspect.signature(self.model.init_state)
+        accepts_var_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in init_state_signature.parameters.values()
+        )
+        if not accepts_var_kwargs:
+            init_kwargs = {
+                name: value
+                for name, value in init_kwargs.items()
+                if name in init_state_signature.parameters
+            }
+
         inference_state = self.model.init_state(**init_kwargs)
 
         if not session_id:

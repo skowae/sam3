@@ -542,7 +542,12 @@ class Sam3MultiplexBase(Sam3VideoBase):
             pos_pred_mask = pos_pred_mask.squeeze(0)
             det_out = {k: det_out[k][0] for k in det_out}
             # Move detections we'll actually keep at the top for future logic
-            pos_pred_mask_idx = pos_pred_mask.argsort(descending=True)
+            # CUDA argsort does not support Boolean tensors on every supported
+            # PyTorch/CUDA combination. Cast only the sort key; retain the
+            # original Boolean mask for the tracker planning phase below.
+            pos_pred_mask_idx = pos_pred_mask.to(torch.uint8).argsort(
+                descending=True
+            )            
             pos_pred_mask = torch.index_select(
                 pos_pred_mask, dim=0, index=pos_pred_mask_idx
             )
