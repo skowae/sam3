@@ -1,13 +1,14 @@
 from collections import defaultdict
-from functools import reduce
-from typing import Dict
 
 import numpy as np
-import sam3.model.sam3_multiplex_base
-import sam3.model.sam3_video_base
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torchvision.ops import masks_to_boxes
+from tqdm.auto import tqdm
+
+import sam3.model.sam3_multiplex_base
+import sam3.model.sam3_video_base
 from sam3 import perflib
 from sam3.logger import get_logger
 from sam3.model.box_ops import box_xywh_to_cxcywh, box_xyxy_to_xywh
@@ -20,23 +21,38 @@ from sam3.perflib.compile import (
     compile_wrapper,
     shape_logging_wrapper,
 )
-from sam3.perflib.masks_ops import mask_iou, masks_to_boxes as perf_masks_to_boxes
-from torch import Tensor
-from torchvision.ops import masks_to_boxes
-from tqdm.auto import tqdm
+from sam3.perflib.masks_ops import masks_to_boxes as perf_masks_to_boxes
 
 logger = get_logger(__name__)
 
-import gc
+
+def _keep_dominant_cc(masks_bool: torch.Tensor) -> torch.Tensor:
+    """Keep only the dominant connected component of each bool mask (N, H, W).
+
+    Removes disconnected floating regions (e.g. a tiny island belonging to another
+    object) that would otherwise stretch the bounding box via masks_to_boxes, which
+    takes min/max over every foreground pixel. Empty masks stay empty. Uses the
+    sam3 perflib connected_components utility (cc_torch / triton on GPU).
+    """
+    if masks_bool.numel() == 0:
+        return masks_bool
+    from sam3.perflib.connected_components import connected_components
+
+    _, counts = connected_components(masks_bool.to(torch.uint8))  # (N, 1, H, W)
+    counts = counts.squeeze(1).to(torch.int64)  # (N, H, W): per-pixel CC size
+    max_counts = counts.amax(dim=(1, 2), keepdim=True)  # (N, 1, 1)
+    keep = (counts >= max_counts) & masks_bool
+    return keep
+
+
 from collections.abc import Mapping, Sequence
 from dataclasses import fields, is_dataclass
-from typing import List
 
 from sam3.model.data_misc import (
     BatchedPointer,
-    convert_my_tensors,
     FindStage,
     NestedTensor,
+    convert_my_tensors,
 )
 from sam3.model.geometry_encoders import Prompt
 from sam3.model.io_utils import load_resource_as_video_frames
@@ -724,6 +740,35 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
             out_sam2_probs = torch.index_select(out_sam2_probs, 0, keep_idx)
             out_binary_masks = torch.index_select(out_binary_masks, 0, keep_idx_gpu)
 
+            # apply non-overlapping constraints on the existing masklets (before box
+            # computation so masks zeroed by the constraint don't emit empty boxes)
+            if out_binary_masks.shape[0] > 1:
+                assert len(out_binary_masks) == len(out_sam2_probs)
+                out_binary_masks = (
+                    self.tracker._apply_object_wise_non_overlapping_constraints(
+                        out_binary_masks.unsqueeze(1),
+                        out_sam2_probs.unsqueeze(1).to(out_binary_masks.device),
+                        background_value=0,
+                    ).squeeze(1)
+                ) > 0
+
+            # keep only the dominant connected component of each mask: removes
+            # disconnected floating islands that would otherwise stretch the box
+            if (
+                getattr(self, "output_cc_filter", False)
+                and out_binary_masks.shape[0] > 0
+            ):
+                out_binary_masks = _keep_dominant_cc(out_binary_masks)
+
+            # drop masks left empty (e.g. fully suppressed by the constraint); an
+            # empty mask must not emit a bounding box
+            nonempty = out_binary_masks.any(dim=(1, 2))
+            if not bool(nonempty.all()):
+                out_obj_ids = out_obj_ids[nonempty]
+                out_probs = out_probs[nonempty]
+                out_sam2_probs = out_sam2_probs[nonempty]
+                out_binary_masks = out_binary_masks[nonempty]
+
             if perflib.is_enabled:
                 out_boxes_xyxy = perf_masks_to_boxes(
                     out_binary_masks, out_obj_ids.tolist()
@@ -737,17 +782,6 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
             out_boxes_xywh[..., 1] /= H_video
             out_boxes_xywh[..., 2] /= W_video
             out_boxes_xywh[..., 3] /= H_video
-
-        # apply non-overlapping constraints on the existing masklets
-        if out_binary_masks.shape[0] > 1:
-            assert len(out_binary_masks) == len(out_sam2_probs)
-            out_binary_masks = (
-                self.tracker._apply_object_wise_non_overlapping_constraints(
-                    out_binary_masks.unsqueeze(1),
-                    out_sam2_probs.unsqueeze(1).to(out_binary_masks.device),
-                    background_value=0,
-                ).squeeze(1)
-            ) > 0
 
         prod_outputs = {}
         if self.running_in_prod:
@@ -953,6 +987,18 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
         # Filter masks on GPU
         kept_masks = torch.index_select(all_masks, 0, keep_indices)
 
+        # keep only the dominant connected component of each mask: removes
+        # disconnected floating islands that would otherwise stretch the box
+        if getattr(self, "output_cc_filter", False) and kept_masks.shape[0] > 0:
+            kept_masks = _keep_dominant_cc(kept_masks)
+
+            # drop masks left empty after CC filtering, and recompute keep_indices
+            # so downstream per-frame splitting stays aligned
+            nonempty = kept_masks.any(dim=(1, 2))
+            if not bool(nonempty.all()):
+                kept_masks = kept_masks[nonempty]
+                keep_indices = keep_indices[nonempty.cpu()]
+
         # Compute bounding boxes in batch on GPU
         if perflib.is_enabled:
             # Need to gather obj_ids for perflib
@@ -1023,7 +1069,8 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
             out_masks = split_masks[idx]
             out_boxes = split_boxes[idx]
 
-            # Apply non-overlapping constraints (per-frame operation)
+            # Apply non-overlapping constraints (per-frame operation) BEFORE box
+            # computation so masks zeroed by the constraint don't emit empty boxes
             if out_masks.shape[0] > 1:
                 # Copy sam2_probs to CPU pinned memory then back to GPU for the operation
                 out_sam2_probs_cpu = torch.empty(
@@ -1037,6 +1084,25 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
                         background_value=0,
                     ).squeeze(1)
                 ) > 0
+
+            # drop masks left empty after the constraint; an empty mask must not
+            # emit a bounding box — recompute the box from the final mask
+            nonempty = out_masks.any(dim=(1, 2))
+            if not bool(nonempty.all()):
+                out_masks = out_masks[nonempty]
+                out_obj_ids = out_obj_ids[nonempty.cpu()]
+                out_probs = out_probs[nonempty.cpu()]
+                if perflib.is_enabled:
+                    out_boxes_xyxy = perf_masks_to_boxes(
+                        out_masks, out_obj_ids.tolist()
+                    )
+                else:
+                    out_boxes_xyxy = masks_to_boxes(out_masks)
+                out_boxes = box_xyxy_to_xywh(out_boxes_xyxy)
+                out_boxes[..., 0] /= W_video
+                out_boxes[..., 1] /= H_video
+                out_boxes[..., 2] /= W_video
+                out_boxes[..., 3] /= H_video
 
             final_results.append(
                 (frame_i, out_obj_ids, out_probs, out_boxes, out_masks)
@@ -3157,7 +3223,6 @@ class Sam3MultiplexTrackingWithInteractivity(Sam3MultiplexTracking):
             logger.info(
                 f"Cleared detector mask only conditioning frames ({mask_only_cond_frame_indices}) in SAM2."
             )
-        return
 
     def _extract_object_to_singleton_state(self, inference_state, obj_id, obj_rank):
         """

@@ -2,14 +2,14 @@
 
 # pyre-unsafe
 
-import os
 from typing import Optional
 
 import pkg_resources
 import torch
-import torch.nn as nn
 from huggingface_hub import hf_hub_download
 from iopath.common.file_io import g_pathmgr
+from torch import nn
+
 from sam3.model.decoder import (
     DecoupledTransformerDecoderLayerv2,
     SimpleRoPEAttention,
@@ -29,10 +29,12 @@ from sam3.model.memory import (
     SimpleMaskEncoder,
 )
 from sam3.model.model_misc import (
-    DotProductScoring,
     MLP,
-    MultiheadAttentionWrapper as MultiheadAttention,
+    DotProductScoring,
     TransformerWrapper,
+)
+from sam3.model.model_misc import (
+    MultiheadAttentionWrapper as MultiheadAttention,
 )
 from sam3.model.multiplex_utils import MultiplexController
 from sam3.model.necks import Sam3DualViTDetNeck, Sam3TriViTDetNeck
@@ -44,7 +46,6 @@ from sam3.model.sam3_video_inference import Sam3VideoInferenceWithInstanceIntera
 from sam3.model.sam3_video_predictor import Sam3VideoPredictorMultiGPU
 from sam3.model.text_encoder_ve import VETextEncoder
 from sam3.model.tokenizer_ve import SimpleTokenizer
-from sam3.model.video_tracking_multiplex import VideoTrackingDynamicMultiplex
 from sam3.model.vitdet import ViT
 from sam3.model.vl_combiner import SAM3VLBackbone, SAM3VLBackboneTri, TriHeadVisionOnly
 from sam3.sam.transformer import RoPEAttention
@@ -1079,6 +1080,25 @@ def build_sam3_multiplex_video_predictor(
     session_expiration_sec: int = 1200,
     default_output_prob_thresh: float = 0.5,
     async_loading_frames: bool = True,
+    # Optional overrides for the internal tracking thresholds baked into the demo
+    # model below. None keeps the built-in default.
+    score_threshold_detection: Optional[float] = None,
+    new_det_thresh: Optional[float] = None,
+    hotstart_delay: Optional[int] = None,
+    hotstart_unmatch_thresh: Optional[int] = None,
+    hotstart_dup_thresh: Optional[int] = None,
+    det_nms_thresh: Optional[float] = None,
+    # The multiplex builder zeroes these, which disables the built-in
+    # connected-component cleanup (fill holes / remove sprinkles) and the
+    # bbox-IoU-mismatch reconditioning. None keeps the built-in (zeroed) default.
+    fill_hole_area: Optional[int] = None,
+    sprinkle_removal_area: Optional[int] = None,
+    reconstruction_bbox_iou_thresh: Optional[float] = None,
+    reconstruction_bbox_det_score: Optional[float] = None,
+    # Keep only the dominant connected component of each output mask before the
+    # bounding box is computed (removes disconnected mask islands + empty-mask
+    # boxes at the source). Default off.
+    output_cc_filter: Optional[bool] = None,
 ):
     """
     Build a fully-initialized Sam3MultiplexVideoPredictor.
@@ -1167,35 +1187,55 @@ def build_sam3_multiplex_video_predictor(
     demo_model = Sam3MultiplexTrackingWithInteractivity(
         tracker=sam2_predictor,
         detector=detector,
-        score_threshold_detection=0.4,
-        det_nms_thresh=0.1,
+        score_threshold_detection=(
+            0.4 if score_threshold_detection is None else score_threshold_detection
+        ),
+        det_nms_thresh=(0.1 if det_nms_thresh is None else det_nms_thresh),
         det_nms_use_iom=True,
         assoc_iou_thresh=0.1,
-        new_det_thresh=0.65,
-        hotstart_delay=15,
-        hotstart_unmatch_thresh=8,
-        hotstart_dup_thresh=8,
+        new_det_thresh=(0.65 if new_det_thresh is None else new_det_thresh),
+        hotstart_delay=(15 if hotstart_delay is None else hotstart_delay),
+        hotstart_unmatch_thresh=(
+            8 if hotstart_unmatch_thresh is None else hotstart_unmatch_thresh
+        ),
+        hotstart_dup_thresh=(8 if hotstart_dup_thresh is None else hotstart_dup_thresh),
         suppress_unmatched_only_within_hotstart=False,
         suppress_overlapping_based_on_recent_occlusion_threshold=0.7,
         suppress_det_close_to_boundary=True,
-        fill_hole_area=0,  # OV effectively 0 (Sam3MultiplexTrackerPredictor Hydra override clobbers yaml's 16)
+        fill_hole_area=(
+            0 if fill_hole_area is None else fill_hole_area
+        ),  # built-in is 0, disabling CC hole-filling entirely
         recondition_every_nth_frame=16,
         use_iom_recondition=True,
         iom_thresh_recondition=0.5,
         masklet_confirmation_enable=True,
-        reconstruction_bbox_iou_thresh=-1,
-        reconstruction_bbox_det_score=0.8,
+        reconstruction_bbox_iou_thresh=(
+            -1
+            if reconstruction_bbox_iou_thresh is None
+            else reconstruction_bbox_iou_thresh
+        ),  # built-in is -1, disabling bbox-IoU-mismatch reconditioning
+        reconstruction_bbox_det_score=(
+            0.8
+            if reconstruction_bbox_det_score is None
+            else reconstruction_bbox_det_score
+        ),
         max_num_objects=max_num_objects,
         postprocess_batch_size=16,
         use_batched_grounding=True,
         batched_grounding_batch_size=16,
         max_num_kboxes=0,
-        sprinkle_removal_area=0,
+        sprinkle_removal_area=(
+            0 if sprinkle_removal_area is None else sprinkle_removal_area
+        ),  # built-in is 0, disabling CC sprinkle removal entirely
         is_multiplex=True,
         image_size=1008,
         image_mean=(0.5, 0.5, 0.5),
         image_std=(0.5, 0.5, 0.5),
         compile_model=compile,
+    )
+    # output-time CC filter flag, read by _postprocess_output / _postprocess_output_batched
+    demo_model.output_cc_filter = (
+        False if output_cc_filter is None else bool(output_cc_filter)
     )
 
     # Load checkpoint (auto-download from HuggingFace if not provided)
