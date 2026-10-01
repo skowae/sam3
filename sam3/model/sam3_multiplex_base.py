@@ -585,6 +585,53 @@ class Sam3MultiplexBase(Sam3VideoBase):
             "det_to_matched_trk_obj_ids", {}
         )
 
+        # Per-frame, per-tracked-object detector box association, built from the
+        # tracker's own data-association decisions this frame:
+        # - "best": obj_id --> the detection that best overlaps this object's
+        #   mask (highest unambiguous IoM >= 0.5, det score >= 0.8, and this
+        #   object is that detection's best-matching tracklet) -- the same
+        #   association the model uses for reconditioning.
+        # - "loose": obj_id --> every kept detection whose mask overlaps the
+        #   object's mask at IoM >= assoc_iou_thresh (0.1). Det order within
+        #   each list is score-descending (det rows are score-sorted).
+        # Boxes are normalized xyxy (0-1) from the detection head. An object
+        # absent from a dict had no associated detection this frame.
+        trk_id_to_det_idx = sam2_update_plan.get(
+            "trk_id_to_max_iou_high_conf_det", {}
+        )
+        obj_id_to_best_det_box = {
+            obj_id: det_out["bbox"][det_idx]
+            for obj_id, det_idx in trk_id_to_det_idx.items()
+        }
+        obj_id_to_best_det_score = {
+            obj_id: det_out["scores"][det_idx]
+            for obj_id, det_idx in trk_id_to_det_idx.items()
+        }
+        obj_id_to_loose_det_boxes = {}
+        obj_id_to_loose_det_scores = {}
+        for det_idx, matched_obj_ids in det_to_matched_trk_obj_ids.items():
+            for obj_id in matched_obj_ids:
+                obj_id_to_loose_det_boxes.setdefault(obj_id, []).append(
+                    det_out["bbox"][det_idx]
+                )
+                obj_id_to_loose_det_scores.setdefault(obj_id, []).append(
+                    det_out["scores"][det_idx]
+                )
+        obj_id_to_loose_det_boxes = {
+            obj_id: torch.stack(boxes)
+            for obj_id, boxes in obj_id_to_loose_det_boxes.items()
+        }
+        obj_id_to_loose_det_scores = {
+            obj_id: torch.stack(scores)
+            for obj_id, scores in obj_id_to_loose_det_scores.items()
+        }
+        det_assoc = {
+            "obj_id_to_best_det_box": obj_id_to_best_det_box,
+            "obj_id_to_best_det_score": obj_id_to_best_det_score,
+            "obj_id_to_loose_det_boxes": obj_id_to_loose_det_boxes,
+            "obj_id_to_loose_det_scores": obj_id_to_loose_det_scores,
+        }
+
         # Step 4: based on `sam2_update_plan`, each GPU executes the update w.r.t. its local SAM2 inference states
         with torch.profiler.record_function("run_tracker_update_execution_phase"):
             tracker_states_local_new = self.run_tracker_update_execution_phase(
@@ -651,6 +698,7 @@ class Sam3MultiplexBase(Sam3VideoBase):
             frame_stats,
             tracker_obj_scores_global,  # a dict: obj_id --> sam2 frame-level scores
             det_boxes_scores,
+            det_assoc,
         )
 
     # pyre-fixme[14]: `run_backbone_and_detection` overrides method defined in

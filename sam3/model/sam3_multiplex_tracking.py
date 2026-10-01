@@ -46,6 +46,59 @@ def _keep_dominant_cc(masks_bool: torch.Tensor) -> torch.Tensor:
     return keep
 
 
+def _det_box_to_xywh(box_xyxy):
+    """Convert normalized xyxy box(es) to normalized xywh numpy. Accepts (4,) or (N, 4)."""
+    return box_xyxy_to_xywh(box_xyxy).cpu().numpy()
+
+
+def _build_det_assoc_arrays(det_assoc, obj_ids):
+    """Build NaN-aligned per-object detector association arrays.
+
+    Args:
+        det_assoc: the per-frame association dict from `_det_track_one_frame_impl`
+            (None if unavailable, e.g. fetch/partial propagation paths).
+        obj_ids: the final list of tracked object IDs for this frame (the rows of
+            the returned arrays align with this list, i.e. with `out_obj_ids`).
+
+    Returns:
+        (matched_boxes (num_objs, 4), matched_scores (num_objs,),
+         loose_boxes (num_objs, K, 4), loose_scores (num_objs, K)) -- normalized
+         xywh boxes and det scores; NaN where an object has no associated
+         detection. "matched" rows carry the model's best-det association
+         (highest unambiguous IoM >= 0.5 high-confidence det whose best match is
+         this object); "loose" rows carry every kept det overlapping the
+         object's mask at IoM >= assoc_iou_thresh, score-descending, NaN-padded
+         to K = max loose matches across obj_ids.
+    """
+    num_objs = len(obj_ids)
+    matched_boxes = np.full((num_objs, 4), np.nan, dtype=np.float32)
+    matched_scores = np.full((num_objs,), np.nan, dtype=np.float32)
+    loose_rows_boxes = []
+    loose_rows_scores = []
+    max_loose = 0
+    if det_assoc is not None:
+        best_boxes = det_assoc["obj_id_to_best_det_box"]
+        best_scores = det_assoc["obj_id_to_best_det_score"]
+        loose_boxes = det_assoc["obj_id_to_loose_det_boxes"]
+        loose_scores = det_assoc["obj_id_to_loose_det_scores"]
+        for row, obj_id in enumerate(obj_ids):
+            if obj_id in best_boxes:
+                matched_boxes[row] = _det_box_to_xywh(best_boxes[obj_id])
+                matched_scores[row] = float(best_scores[obj_id])
+            lb = loose_boxes.get(obj_id, None)
+            if lb is not None:
+                loose_rows_boxes.append(_det_box_to_xywh(lb))
+                loose_rows_scores.append(loose_scores[obj_id].cpu().numpy())
+                max_loose = max(max_loose, lb.shape[0])
+    loose_boxes_arr = np.full((num_objs, max_loose, 4), np.nan, dtype=np.float32)
+    loose_scores_arr = np.full((num_objs, max_loose), np.nan, dtype=np.float32)
+    for row, arr in enumerate(loose_rows_boxes):
+        n = arr.shape[0]
+        loose_boxes_arr[row, :n] = arr
+        loose_scores_arr[row, :n] = loose_rows_scores[row]
+    return matched_boxes, matched_scores, loose_boxes_arr, loose_scores_arr
+
+
 from collections.abc import Mapping, Sequence
 from dataclasses import fields, is_dataclass
 
@@ -635,6 +688,7 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
             frame_stats,
             _,
             det_boxes_scores,
+            det_assoc,
         ) = self._det_track_one_frame(
             frame_idx=frame_idx,
             num_frames=inference_state["num_frames"],
@@ -663,8 +717,9 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
             "obj_id_to_sam2_score": tracker_metadata_new[
                 "obj_id_to_sam2_score_frame_wise"
             ][frame_idx],
-            "det_boxes_xyxy": det_boxes_scores[0],  # pixel xyxy (num_dets, 4)
+            "det_boxes_xyxy": det_boxes_scores[0],  # normalized xyxy (num_dets, 4)
             "det_scores": det_boxes_scores[1],  # (num_dets,)
+            "det_assoc": det_assoc,
         }
         # removed_obj_ids is only needed on rank 0 to handle hotstart delay buffer
         if self.rank == 0:
@@ -837,6 +892,19 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
             det_boxes_xywh = box_xyxy_to_xywh(det_boxes_xyxy)
             outputs["out_det_scores"] = det_scores.cpu().numpy()
 
+        # Per-object detector association, NaN-aligned with out_obj_ids rows so
+        # each row is directly comparable with out_boxes_xywh / out_probs.
+        (
+            matched_det_boxes,
+            matched_det_scores,
+            loose_det_boxes,
+            loose_det_scores,
+        ) = _build_det_assoc_arrays(out.get("det_assoc", None), out_obj_ids.tolist())
+        outputs["out_matched_det_boxes_xywh"] = matched_det_boxes
+        outputs["out_matched_det_scores"] = matched_det_scores
+        outputs["out_loose_det_boxes_xywh"] = loose_det_boxes
+        outputs["out_loose_det_scores"] = loose_det_scores
+
         return outputs
 
     def _postprocess_output_batched(
@@ -870,6 +938,9 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
         # parallel to frame_data: per-frame (det_boxes_xywh, det_scores) numpy
         # arrays, or None if the frame carries no detector outputs
         det_data = []
+        # parallel to frame_data: per-frame det association dict (obj_id -> det
+        # box/score mappings), or None if the frame carries no association
+        det_assoc_data = []
         device = None
 
         for (
@@ -892,6 +963,8 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
                 )
             else:
                 det_data.append(None)
+
+            det_assoc_data.append(out.get("det_assoc", None))
 
             if len(curr_obj_ids) == 0:
                 frame_data.append((None, None, None, None, None, frame_stats))
@@ -974,6 +1047,16 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
                 if det_data[i] is not None:
                     output_dict["out_det_boxes_xywh"] = det_data[i][0]
                     output_dict["out_det_scores"] = det_data[i][1]
+                output_dict["out_matched_det_boxes_xywh"] = np.zeros(
+                    (0, 4), dtype=np.float32
+                )
+                output_dict["out_matched_det_scores"] = np.zeros(0, dtype=np.float32)
+                output_dict["out_loose_det_boxes_xywh"] = np.zeros(
+                    (0, 0, 4), dtype=np.float32
+                )
+                output_dict["out_loose_det_scores"] = np.zeros(
+                    (0, 0), dtype=np.float32
+                )
                 if self.running_in_prod:
                     output_dict["out_centers"] = np.zeros((0, 2), dtype=np.float32)
                 outputs.append(output_dict)
@@ -1008,6 +1091,16 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
                 if det_data[i] is not None:
                     output_dict["out_det_boxes_xywh"] = det_data[i][0]
                     output_dict["out_det_scores"] = det_data[i][1]
+                output_dict["out_matched_det_boxes_xywh"] = np.zeros(
+                    (0, 4), dtype=np.float32
+                )
+                output_dict["out_matched_det_scores"] = np.zeros(0, dtype=np.float32)
+                output_dict["out_loose_det_boxes_xywh"] = np.zeros(
+                    (0, 0, 4), dtype=np.float32
+                )
+                output_dict["out_loose_det_scores"] = np.zeros(
+                    (0, 0), dtype=np.float32
+                )
                 if self.running_in_prod:
                     output_dict["out_centers"] = np.zeros((0, 2), dtype=np.float32)
                 outputs.append(output_dict)
@@ -1081,6 +1174,9 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
 
         # ========== Phase 6: Apply non-overlapping per frame, collect final results ==========
         final_results = []  # List of (frame_idx, obj_ids, probs, boxes, masks)
+        # frame_data index -> NaN-aligned det association arrays for the frame's
+        # final object list, built once final out_obj_ids are known
+        det_assoc_arrays = {}
 
         for idx, frame_i in enumerate(frames_with_objects):
             data = frame_data[frame_i]
@@ -1134,6 +1230,10 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
                 out_boxes[..., 2] /= W_video
                 out_boxes[..., 3] /= H_video
 
+            det_assoc_arrays[frame_i] = _build_det_assoc_arrays(
+                det_assoc_data[frame_i], out_obj_ids.tolist()
+            )
+
             final_results.append(
                 (frame_i, out_obj_ids, out_probs, out_boxes, out_masks)
             )
@@ -1177,6 +1277,16 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
                 if det_data[i] is not None:
                     output_dict["out_det_boxes_xywh"] = det_data[i][0]
                     output_dict["out_det_scores"] = det_data[i][1]
+                output_dict["out_matched_det_boxes_xywh"] = np.zeros(
+                    (0, 4), dtype=np.float32
+                )
+                output_dict["out_matched_det_scores"] = np.zeros(0, dtype=np.float32)
+                output_dict["out_loose_det_boxes_xywh"] = np.zeros(
+                    (0, 0, 4), dtype=np.float32
+                )
+                output_dict["out_loose_det_scores"] = np.zeros(
+                    (0, 0), dtype=np.float32
+                )
                 if self.running_in_prod:
                     output_dict["out_centers"] = np.zeros((0, 2), dtype=np.float32)
                 outputs.append(output_dict)
@@ -1272,6 +1382,16 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
                 if det_data[i] is not None:
                     output_dict["out_det_boxes_xywh"] = det_data[i][0]
                     output_dict["out_det_scores"] = det_data[i][1]
+                output_dict["out_matched_det_boxes_xywh"] = np.zeros(
+                    (0, 4), dtype=np.float32
+                )
+                output_dict["out_matched_det_scores"] = np.zeros(0, dtype=np.float32)
+                output_dict["out_loose_det_boxes_xywh"] = np.zeros(
+                    (0, 0, 4), dtype=np.float32
+                )
+                output_dict["out_loose_det_scores"] = np.zeros(
+                    (0, 0), dtype=np.float32
+                )
                 outputs.append(output_dict)
             else:
                 buf_offset, num_objects = frame_to_offset_count[i]
@@ -1309,6 +1429,16 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
                 if det_data[i] is not None:
                     output_dict["out_det_boxes_xywh"] = det_data[i][0]
                     output_dict["out_det_scores"] = det_data[i][1]
+                (
+                    matched_det_boxes,
+                    matched_det_scores,
+                    loose_det_boxes,
+                    loose_det_scores,
+                ) = det_assoc_arrays[i]
+                output_dict["out_matched_det_boxes_xywh"] = matched_det_boxes
+                output_dict["out_matched_det_scores"] = matched_det_scores
+                output_dict["out_loose_det_boxes_xywh"] = loose_det_boxes
+                output_dict["out_loose_det_scores"] = loose_det_scores
                 outputs.append(output_dict)
 
         return outputs
