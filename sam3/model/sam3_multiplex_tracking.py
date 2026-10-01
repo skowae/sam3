@@ -21,6 +21,7 @@ from sam3.perflib.compile import (
     compile_wrapper,
     shape_logging_wrapper,
 )
+from sam3.perflib.connected_components import connected_components
 from sam3.perflib.masks_ops import masks_to_boxes as perf_masks_to_boxes
 
 logger = get_logger(__name__)
@@ -36,7 +37,7 @@ def _keep_dominant_cc(masks_bool: torch.Tensor) -> torch.Tensor:
     """
     if masks_bool.numel() == 0:
         return masks_bool
-    from sam3.perflib.connected_components import connected_components
+    
 
     _, counts = connected_components(masks_bool.to(torch.uint8))  # (N, 1, H, W)
     counts = counts.squeeze(1).to(torch.int64)  # (N, H, W): per-pixel CC size
