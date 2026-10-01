@@ -634,6 +634,7 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
             tracker_metadata_new,
             frame_stats,
             _,
+            det_boxes_scores,
         ) = self._det_track_one_frame(
             frame_idx=frame_idx,
             num_frames=inference_state["num_frames"],
@@ -662,6 +663,8 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
             "obj_id_to_sam2_score": tracker_metadata_new[
                 "obj_id_to_sam2_score_frame_wise"
             ][frame_idx],
+            "det_boxes_xyxy": det_boxes_scores[0],  # pixel xyxy (num_dets, 4)
+            "det_scores": det_boxes_scores[1],  # (num_dets,)
         }
         # removed_obj_ids is only needed on rank 0 to handle hotstart delay buffer
         if self.rank == 0:
@@ -828,6 +831,12 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
             "frame_stats": out.get("frame_stats", None),
         } | prod_outputs
 
+        det_boxes_xyxy = out.get("det_boxes_xyxy", None)
+        det_scores = out.get("det_scores", None)
+        if det_boxes_xyxy is not None and det_scores is not None:
+            det_boxes_xywh = box_xyxy_to_xywh(det_boxes_xyxy)
+            outputs["out_det_scores"] = det_scores.cpu().numpy()
+
         return outputs
 
     def _postprocess_output_batched(
@@ -858,6 +867,9 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
         # We'll track: frame_data[i] = (obj_ids, probs, sam2_probs, masks, keep_mask, frame_stats)
         # or None if frame has no objects
         frame_data = []
+        # parallel to frame_data: per-frame (det_boxes_xywh, det_scores) numpy
+        # arrays, or None if the frame carries no detector outputs
+        det_data = []
         device = None
 
         for (
@@ -869,6 +881,17 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
             obj_id_to_mask = out["obj_id_to_mask"]
             curr_obj_ids = sorted(obj_id_to_mask.keys())
             frame_stats = out.get("frame_stats", None)
+
+            # per-frame detector outputs (NOT aligned with tracked obj_ids)
+            det_boxes_xyxy = out.get("det_boxes_xyxy", None)
+            det_scores = out.get("det_scores", None)
+            if det_boxes_xyxy is not None and det_scores is not None:
+                det_boxes_xywh = box_xyxy_to_xywh(det_boxes_xyxy)
+                det_data.append(
+                    (det_boxes_xywh.cpu().numpy(), det_scores.cpu().numpy())
+                )
+            else:
+                det_data.append(None)
 
             if len(curr_obj_ids) == 0:
                 frame_data.append((None, None, None, None, None, frame_stats))
@@ -940,7 +963,7 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
         # Handle case where all frames have 0 objects
         if len(frames_with_objects) == 0:
             outputs = []
-            for data in frame_data:
+            for i, data in enumerate(frame_data):
                 output_dict = {
                     "out_obj_ids": np.zeros(0, dtype=np.int64),
                     "out_probs": np.zeros(0, dtype=np.float32),
@@ -948,6 +971,9 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
                     "out_binary_masks": np.zeros((0, H_video, W_video), dtype=bool),
                     "frame_stats": data[5],
                 }
+                if det_data[i] is not None:
+                    output_dict["out_det_boxes_xywh"] = det_data[i][0]
+                    output_dict["out_det_scores"] = det_data[i][1]
                 if self.running_in_prod:
                     output_dict["out_centers"] = np.zeros((0, 2), dtype=np.float32)
                 outputs.append(output_dict)
@@ -971,7 +997,7 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
         if len(keep_indices) == 0:
             # All objects filtered out
             outputs = []
-            for data in frame_data:
+            for i, data in enumerate(frame_data):
                 output_dict = {
                     "out_obj_ids": np.zeros(0, dtype=np.int64),
                     "out_probs": np.zeros(0, dtype=np.float32),
@@ -979,6 +1005,9 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
                     "out_binary_masks": np.zeros((0, H_video, W_video), dtype=bool),
                     "frame_stats": data[5],
                 }
+                if det_data[i] is not None:
+                    output_dict["out_det_boxes_xywh"] = det_data[i][0]
+                    output_dict["out_det_scores"] = det_data[i][1]
                 if self.running_in_prod:
                     output_dict["out_centers"] = np.zeros((0, 2), dtype=np.float32)
                 outputs.append(output_dict)
@@ -1137,7 +1166,7 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
         # Handle case where all filtered out
         if len(final_results) == 0:
             outputs = []
-            for data in frame_data:
+            for i, data in enumerate(frame_data):
                 output_dict = {
                     "out_obj_ids": np.zeros(0, dtype=np.int64),
                     "out_probs": np.zeros(0, dtype=np.float32),
@@ -1145,6 +1174,9 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
                     "out_binary_masks": np.zeros((0, H_video, W_video), dtype=bool),
                     "frame_stats": data[5],
                 }
+                if det_data[i] is not None:
+                    output_dict["out_det_boxes_xywh"] = det_data[i][0]
+                    output_dict["out_det_scores"] = det_data[i][1]
                 if self.running_in_prod:
                     output_dict["out_centers"] = np.zeros((0, 2), dtype=np.float32)
                 outputs.append(output_dict)
@@ -1237,6 +1269,9 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
                 }
                 if all_centers is not None:
                     output_dict["out_centers"] = np.zeros((0, 2), dtype=np.float32)
+                if det_data[i] is not None:
+                    output_dict["out_det_boxes_xywh"] = det_data[i][0]
+                    output_dict["out_det_scores"] = det_data[i][1]
                 outputs.append(output_dict)
             else:
                 buf_offset, num_objects = frame_to_offset_count[i]
@@ -1271,6 +1306,9 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
                         .numpy()
                         .copy()
                     )
+                if det_data[i] is not None:
+                    output_dict["out_det_boxes_xywh"] = det_data[i][0]
+                    output_dict["out_det_scores"] = det_data[i][1]
                 outputs.append(output_dict)
 
         return outputs

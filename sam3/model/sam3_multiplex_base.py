@@ -638,6 +638,11 @@ class Sam3MultiplexBase(Sam3VideoBase):
                 dict(zip(sam2_obj_ids, tracker_obj_scores_global))
             )
 
+        # per-frame detector boxes for ALL positive detections (already NMS'd,
+        # above score_threshold_detection, sorted by score descending).
+        # NOT aligned with tracked obj_ids; the caller matches by IoU if needed.
+        det_boxes_scores = (det_out["bbox"], det_out["scores"])
+
         return (
             obj_id_to_mask,  # a dict: obj_id --> output mask
             obj_id_to_score,  # a dict: obj_id --> output score (prob)
@@ -645,6 +650,7 @@ class Sam3MultiplexBase(Sam3VideoBase):
             tracker_metadata_new,
             frame_stats,
             tracker_obj_scores_global,  # a dict: obj_id --> sam2 frame-level scores
+            det_boxes_scores,
         )
 
     # pyre-fixme[14]: `run_backbone_and_detection` overrides method defined in
